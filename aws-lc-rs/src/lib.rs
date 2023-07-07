@@ -137,6 +137,8 @@ mod evp_pkey;
 mod fips;
 mod hex;
 pub mod iv;
+#[allow(clippy::module_name_repetitions)]
+pub mod kem;
 mod ptr;
 mod rsa;
 pub mod tls_prf;
