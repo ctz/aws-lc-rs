@@ -13,13 +13,11 @@
 //! use aws_lc_rs::{
 //!     error::Unspecified,
 //!     kem::{Ciphertext, DecapsulationKey, EncapsulationKey},
-//!     unstable::kem::{AlgorithmId, get_algorithm}
+//!     unstable::kem::{AlgorithmId, ML_KEM_512}
 //! };
 //!
-//! let kyber512_r3 = get_algorithm(AlgorithmId::Kyber512_R3).ok_or(Unspecified)?;
-//!
 //! // Alice generates their (private) decapsulation key.
-//! let decapsulation_key = DecapsulationKey::generate(kyber512_r3)?;
+//! let decapsulation_key = DecapsulationKey::generate(&ML_KEM_512)?;
 //!
 //! // Alices computes the (public) encapsulation key.
 //! let encapsulation_key = decapsulation_key.encapsulation_key()?;
@@ -31,12 +29,12 @@
 //! let encapsulation_key_bytes = encapsulation_key_bytes.as_ref();
 //!
 //! // Bob constructs the (public) encapsulation key from the key bytes provided by Alice.
-//! let retrieved_encapsulation_key = EncapsulationKey::new(kyber512_r3, encapsulation_key_bytes)?;
+//! let retrieved_encapsulation_key = EncapsulationKey::new(&ML_KEM_512, encapsulation_key_bytes)?;
 //!
 //! // Bob executes the encapsulation algorithm to to produce their copy of the secret, and associated ciphertext.
 //! let (ciphertext, bob_secret) = retrieved_encapsulation_key.encapsulate()?;
 //!
-//! // Alice recieves ciphertext bytes from bob
+//! // Alice receives ciphertext bytes from bob
 //! let ciphertext_bytes = ciphertext.as_ref();
 //!
 //! // Bob sends Alice the ciphertext computed from the encapsulation algorithm, Alice runs decapsulation to derive their
@@ -58,7 +56,8 @@ use alloc::borrow::Cow;
 use aws_lc::{
     EVP_PKEY_CTX_kem_set_params, EVP_PKEY_CTX_new_id, EVP_PKEY_decapsulate, EVP_PKEY_encapsulate,
     EVP_PKEY_get_raw_private_key, EVP_PKEY_get_raw_public_key, EVP_PKEY_kem_new_raw_public_key,
-    EVP_PKEY_keygen, EVP_PKEY_keygen_init, EVP_PKEY, EVP_PKEY_KEM,
+    EVP_PKEY_keygen, EVP_PKEY_keygen_init, EVP_PKEY, EVP_PKEY_KEM, NID_MLKEM1024, NID_MLKEM512,
+    NID_MLKEM768,
 };
 use core::{cmp::Ordering, ptr::null_mut};
 use zeroize::Zeroize;
@@ -136,14 +135,27 @@ where
 /// Identifier for a KEM algorithm.
 ///
 /// See [`crate::unstable::kem::AlgorithmId`] and [`crate::unstable::kem::get_algorithm`] for
-/// access to algorithms not subject to semantic versioning gurantees.
+/// access to algorithms not subject to semantic versioning guarantees.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum AlgorithmId {}
+pub enum AlgorithmId {
+    /// NIST FIPS 203 ML-KEM-512 algorithm.
+    MlKem512,
+
+    /// NIST FIPS 203 ML-KEM-768 algorithm.
+    MlKem768,
+
+    /// NIST FIPS 203 ML-KEM-1024 algorithm.
+    MlKem1024,
+}
 
 impl AlgorithmIdentifier for AlgorithmId {
     fn nid(self) -> i32 {
-        unreachable!()
+        match self {
+            AlgorithmId::MlKem512 => NID_MLKEM512,
+            AlgorithmId::MlKem768 => NID_MLKEM768,
+            AlgorithmId::MlKem1024 => NID_MLKEM1024,
+        }
     }
 }
 
@@ -457,7 +469,12 @@ fn kem_key_generate(nid: i32) -> Result<LcPtr<EVP_PKEY>, Unspecified> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ciphertext, SharedSecret};
+    use crate::error::KeyRejected;
+
+    use super::{Ciphertext, DecapsulationKey, EncapsulationKey, SharedSecret};
+
+    #[cfg(feature = "unstable")]
+    use crate::unstable::kem::{ML_KEM_1024, ML_KEM_512, ML_KEM_768};
 
     #[test]
     fn ciphertext() {
@@ -476,5 +493,110 @@ mod tests {
         let secret_bytes = vec![42u8; 4];
         let shared_secret = SharedSecret::new(secret_bytes.into_boxed_slice());
         assert_eq!(shared_secret.as_ref(), &[42, 42, 42, 42]);
+    }
+
+    #[test]
+    fn test_kem_serialize() {
+        for algorithm in [&ML_KEM_512, &ML_KEM_768, &ML_KEM_1024] {
+            let priv_key = DecapsulationKey::generate(algorithm).unwrap();
+            assert_eq!(priv_key.algorithm(), algorithm);
+
+            let pub_key = priv_key.encapsulation_key().unwrap();
+            let pubkey_raw_bytes = pub_key.key_bytes().unwrap();
+            let pub_key_from_bytes =
+                EncapsulationKey::new(algorithm, pubkey_raw_bytes.as_ref()).unwrap();
+
+            assert_eq!(
+                pub_key.key_bytes().unwrap().as_ref(),
+                pub_key_from_bytes.key_bytes().unwrap().as_ref()
+            );
+            assert_eq!(pub_key.algorithm(), pub_key_from_bytes.algorithm());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "unstable")]
+    fn test_kem_wrong_sizes() {
+        for algorithm in [&ML_KEM_512, &ML_KEM_768, &ML_KEM_1024] {
+            let too_long_bytes = vec![0u8; algorithm.encapsulate_key_size() + 1];
+            let long_pub_key_from_bytes = EncapsulationKey::new(algorithm, &too_long_bytes);
+            assert_eq!(
+                long_pub_key_from_bytes.err(),
+                Some(KeyRejected::too_large())
+            );
+
+            let too_short_bytes = vec![0u8; algorithm.encapsulate_key_size() - 1];
+            let short_pub_key_from_bytes = EncapsulationKey::new(algorithm, &too_short_bytes);
+            assert_eq!(
+                short_pub_key_from_bytes.err(),
+                Some(KeyRejected::too_small())
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "unstable")]
+    fn test_kem_e2e() {
+        for algorithm in [&ML_KEM_512, &ML_KEM_768, &ML_KEM_1024] {
+            let priv_key = DecapsulationKey::generate(algorithm).unwrap();
+            assert_eq!(priv_key.algorithm(), algorithm);
+
+            let pub_key = priv_key.encapsulation_key().unwrap();
+
+            let (alice_ciphertext, alice_secret) =
+                pub_key.encapsulate().expect("encapsulate successful");
+
+            let bob_secret = priv_key
+                .decapsulate(alice_ciphertext)
+                .expect("decapsulate successful");
+
+            assert_eq!(alice_secret.as_ref(), bob_secret.as_ref());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "unstable")]
+    fn test_serialized_kem_e2e() {
+        for algorithm in [&ML_KEM_512, &ML_KEM_768, &ML_KEM_1024] {
+            let priv_key = DecapsulationKey::generate(algorithm).unwrap();
+            assert_eq!(priv_key.algorithm(), algorithm);
+
+            let pub_key = priv_key.encapsulation_key().unwrap();
+
+            // Generate public key bytes to send to bob
+            let pub_key_bytes = pub_key.key_bytes().unwrap();
+
+            // Test that priv_key's EVP_PKEY isn't entirely freed since we remove this pub_key's reference.
+            drop(pub_key);
+
+            let retrieved_pub_key =
+                EncapsulationKey::new(algorithm, pub_key_bytes.as_ref()).unwrap();
+            let (ciphertext, bob_secret) = retrieved_pub_key
+                .encapsulate()
+                .expect("encapsulate successful");
+
+            let alice_secret = priv_key
+                .decapsulate(ciphertext)
+                .expect("encapsulate successful");
+
+            assert_eq!(alice_secret.as_ref(), bob_secret.as_ref());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "unstable")]
+    fn test_debug_fmt() {
+        let private = DecapsulationKey::generate(&ML_KEM_512).expect("successful generation");
+        assert_eq!(
+            format!("{private:?}"),
+            "DecapsulationKey { algorithm: MlKem512, .. }"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                private.encapsulation_key().expect("public key retrievable")
+            ),
+            "EncapsulationKey { algorithm: MlKem512, .. }"
+        );
     }
 }
